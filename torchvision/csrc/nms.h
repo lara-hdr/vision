@@ -8,7 +8,9 @@
 at::Tensor nms(
     const at::Tensor& dets,
     const at::Tensor& scores,
-    const float iou_threshold) {
+    // only double is not supported for op registration
+    // (replace float by double)
+    const double iou_threshold) {
   if (dets.device().is_cuda()) {
 #ifdef WITH_CUDA
     if (dets.numel() == 0) {

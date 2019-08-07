@@ -103,6 +103,17 @@ class FeaturePyramidNetwork(nn.Module):
         return out
 
 
+class FeaturePyramidNetworkONNX(nn.Module):
+    def __init__(self, in_channels_list, out_channels, extra_blocks=None):
+        super(FeaturePyramidNetworkONNX, self).__init__()
+        self.FPN = FeaturePyramidNetwork(in_channels_list, out_channels, extra_blocks)
+
+    def forward(self, x):
+        x = dict(("feature" + str(i), xi) for i, xi in enumerate(x))
+        out = self.FPN(x)
+        return list(out.values())
+
+
 class ExtraFPNBlock(nn.Module):
     """
     Base class for the extra block in the FPN.

@@ -7,6 +7,8 @@ from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair
 
 from torchvision.extension import _lazy_import
+import torchvision.ops._custom_ops
+
 from ._utils import convert_boxes_to_roi_format
 
 
@@ -59,7 +61,13 @@ def roi_pool(input, boxes, output_size, spatial_scale=1.0):
     rois = boxes
     if not isinstance(rois, torch.Tensor):
         rois = convert_boxes_to_roi_format(rois)
-    return _RoIPoolFunction.apply(input, rois, output_size, spatial_scale)
+    if torch._C._get_tracing_state():
+        output, _ = torch.ops.torchvision.roi_pool_forward(
+            input, rois, spatial_scale,
+            output_size[0], output_size[1])
+        return output
+    else :
+        return _RoIPoolFunction.apply(input, rois, output_size, spatial_scale)
 
 
 class RoIPool(nn.Module):

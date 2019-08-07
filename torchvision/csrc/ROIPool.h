@@ -9,9 +9,11 @@
 std::tuple<at::Tensor, at::Tensor> ROIPool_forward(
     const at::Tensor& input,
     const at::Tensor& rois,
-    const float spatial_scale,
-    const int pooled_height,
-    const int pooled_width) {
+    // only double and int are not supported for op registration
+    // (replace float by double and int by int64_t)
+    const double spatial_scale,
+    const int64_t pooled_height,
+    const int64_t pooled_width) {
   if (input.type().is_cuda()) {
 #ifdef WITH_CUDA
     return ROIPool_forward_cuda(

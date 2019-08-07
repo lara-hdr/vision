@@ -6,6 +6,24 @@ from torch import nn
 from torchvision.ops import roi_align
 from torchvision.ops.boxes import box_area
 
+def merge_levels_onnx(levels, unmerged_results):
+    first_result = unmerged_results[0]
+    dtype, device = first_result.dtype, first_result.device
+    zeros_size = (levels.size(0).item(), first_result.size(1).item(),
+                first_result.size(2).item(), first_result.size(3).item())
+    res = torch.zeros(zeros_size,
+                      dtype=dtype, device=device)
+
+    for l in range(len(unmerged_results)):
+        index = (levels == torch.full_like(levels,l)).nonzero().view(-1, 1, 1, 1)
+        # WORK AROUND: masked_scatter_ not in ONNX
+        index = index.expand(index.size(0).item(),
+                        unmerged_results[l].size(1).item(),
+                        unmerged_results[l].size(2).item(),
+                        unmerged_results[l].size(3).item()).to(torch.long)
+
+        res.scatter_(0, index, unmerged_results[l])
+    return res
 
 class LevelMapper(object):
     """Determine which FPN level each RoI in a set of RoIs should map to based
@@ -35,7 +53,10 @@ class LevelMapper(object):
         s = torch.sqrt(torch.cat([box_area(boxlist) for boxlist in boxlists]))
 
         # Eqn.(1) in FPN paper
-        target_lvls = torch.floor(self.lvl0 + torch.log2(s / self.s0 + self.eps))
+        #target_lvls = torch.floor(self.lvl0 + torch.log2(s / self.s0 + self.eps))
+        target_lvls = torch.floor(torch.tensor(self.lvl0, dtype=torch.float32) +
+                                  torch.log2(torch.tensor(self.eps, dtype=torch.float32) +
+                                            s / self.s0))
         target_lvls = torch.clamp(target_lvls, min=self.k_min, max=self.k_max)
         return target_lvls.to(torch.int64) - self.k_min
 
@@ -134,12 +155,19 @@ class MultiScaleRoIAlign(nn.Module):
             self.setup_scales(x, image_shapes)
 
         if num_levels == 1:
-            return roi_align(
-                x[0], rois,
-                output_size=self.output_size,
-                spatial_scale=self.scales[0],
-                sampling_ratio=self.sampling_ratio
-            )
+            if torch._C._get_tracing_state():
+                return torch.ops.torchvision.roi_align_forward(
+                    x[0], rois, self.scales[0],
+                    self.output_size[0],
+                    self.output_size[1],
+                    self.sampling_ratio)
+            else :
+                return roi_align(
+                    x[0], rois,
+                    output_size=self.output_size,
+                    spatial_scale=self.scales[0],
+                    sampling_ratio=self.sampling_ratio
+                )
 
         levels = self.map_levels(boxes)
 
@@ -153,14 +181,36 @@ class MultiScaleRoIAlign(nn.Module):
             device=device,
         )
 
+        unmerged_results = []
         for level, (per_level_feature, scale) in enumerate(zip(x, self.scales)):
             idx_in_level = torch.nonzero(levels == level).squeeze(1)
             rois_per_level = rois[idx_in_level]
 
-            result[idx_in_level] = roi_align(
-                per_level_feature, rois_per_level,
-                output_size=self.output_size,
-                spatial_scale=scale, sampling_ratio=self.sampling_ratio
-            )
+            if torch._C._get_tracing_state():
+                unmerged_results.append(torch.ops.torchvision.roi_align_forward(
+                    per_level_feature, rois_per_level, scale,
+                    self.output_size[0],
+                    self.output_size[1],
+                    self.sampling_ratio
+                ).to(dtype))
+                result = merge_levels_onnx(levels, unmerged_results)
+            else :
+                result[idx_in_level] = roi_align(
+                    per_level_feature, rois_per_level,
+                    output_size=self.output_size,
+                    spatial_scale=scale, sampling_ratio=self.sampling_ratio
+                )
 
         return result
+
+
+class MultiScaleRoIAlignONNX(nn.Module):
+    def __init__(self, featmap_names, output_size, sampling_ratio):
+        super(MultiScaleRoIAlignONNX, self).__init__()
+        self.MSRA = MultiScaleRoIAlign(featmap_names, output_size, sampling_ratio)
+
+    def forward(self, x, boxes, image_shapes):
+        x = dict((i, xi) for i, xi in enumerate(x))
+        image_shapes = [(s[0].item(), s[1].item()) for s in image_shapes]
+        out = self.MSRA(x, boxes, image_shapes)
+        return out
