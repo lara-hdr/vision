@@ -76,9 +76,26 @@ class FeaturePyramidNetwork(nn.Module):
             results (OrderedDict[Tensor]): feature maps after FPN layers.
                 They are ordered from highest resolution first.
         """
-        # unpack OrderedDict into two lists for easier handling
-        names = list(x.keys())
-        x = list(x.values())
+        # Tracing does not support dictionaries as output, and
+        # ONNX (flattening_args) does not yet support dictionaries as inputs.
+        #
+        # For ONNX exports, the inputs/outpus are expected as follows:
+        #
+        # x (List[Tensor])
+        # results (List[Tensor])
+        #
+        # Example :
+        #
+        # >>> m = torchvision.ops.FeaturePyramidNetworkONNX([10, 20, 30], 5)
+        # >>> x = [torch.rand(1, 10, 64, 64), torch.rand(1, 20, 16, 16), torch.rand(1, 30, 8, 8)]
+        # >>> output = m(x)
+        #
+        if isinstance(x, list):
+            names = ["feature" + str(i) for i in range(0, len(x))]
+        else:
+            # unpack OrderedDict into two lists for easier handling
+            names = list(x.keys())
+            x = list(x.values())
 
         last_inner = self.inner_blocks[-1](x[-1])
         results = []
@@ -100,18 +117,10 @@ class FeaturePyramidNetwork(nn.Module):
         # make it back an OrderedDict
         out = OrderedDict([(k, v) for k, v in zip(names, results)])
 
-        return out
-
-
-class FeaturePyramidNetworkONNX(nn.Module):
-    def __init__(self, in_channels_list, out_channels, extra_blocks=None):
-        super(FeaturePyramidNetworkONNX, self).__init__()
-        self.FPN = FeaturePyramidNetwork(in_channels_list, out_channels, extra_blocks)
-
-    def forward(self, x):
-        x = dict(("feature" + str(i), xi) for i, xi in enumerate(x))
-        out = self.FPN(x)
-        return list(out.values())
+        if torch._C._get_tracing_state():
+            return list(out.values())
+        else:
+            return out
 
 
 class ExtraFPNBlock(nn.Module):

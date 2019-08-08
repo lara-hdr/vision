@@ -3,6 +3,7 @@ from torchvision.extension import _lazy_import
 
 import torchvision.ops._custom_ops
 
+
 def nms(boxes, scores, iou_threshold):
     """
     Performs non-maximum suppression (NMS) on the boxes according
@@ -27,7 +28,7 @@ def nms(boxes, scores, iou_threshold):
 
     if torch._C._get_tracing_state():
         return torch.ops.torchvision.nms(boxes, scores, iou_threshold)
-    else :
+    else:
         _C = _lazy_import()
         return _C.nms(boxes, scores, iou_threshold)
 

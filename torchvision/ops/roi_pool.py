@@ -66,7 +66,7 @@ def roi_pool(input, boxes, output_size, spatial_scale=1.0):
             input, rois, spatial_scale,
             output_size[0], output_size[1])
         return output
-    else :
+    else:
         return _RoIPoolFunction.apply(input, rois, output_size, spatial_scale)
 
 
