@@ -12,7 +12,7 @@ def ort_validate(model_name, input, output):
         return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
 
     input, _ = torch.jit._flatten(input)
-    # output, _ = torch.jit._flatten(output)
+    output, _ = torch.jit._flatten(output)
     inputs = list(map(to_numpy, input))
     # outputs = list(map(to_numpy, output))
 
@@ -26,24 +26,27 @@ def ort_validate(model_name, input, output):
     for i in range(0, len(output)):
         try:
             numpy.testing.assert_allclose(to_numpy(output[i]), ort_outs[i], rtol=1e-03, atol=1e-05)
+            print("** input ", i, " validated", ort_outs[i].shape)
         except Exception as e:
             print("******************* failed on ", ort_session.get_outputs()[i].name)
             print(str(e))
 
 
 def export_and_check_model(model, model_name, input):
+    model.eval()
+
     print("Running----------------------")
-    out = model(*input)
+    out = model(input)
 
     print("Exporting----------------------")
     torch.onnx._export(model,
-                       (input[0], input[1], input[2]),
+                       (input),
                        model_name,
                        do_constant_folding=True,
                        opset_version=10)
     print(model_name + ' exported')
-    # ort_validate(model_name, input, out)
-    # print(model_name + ' validated')
+    ort_validate(model_name, input, [list(x.values()) for x in out])
+    print(model_name + ' validated')
 
 
 # ------------------------- roi_align
@@ -149,4 +152,37 @@ class Module(torch.nn.Module):
     def forward(self, boxes):
         return torchvision.ops.boxes.box_area(boxes)
 export_and_check_model(Module(), 'box_area.onnx', (boxes))
+'''
+
+# -------------------------------------------------- models
+'''
+# input = [torch.randn(3, 300, 400), torch.randn(3, 500, 400)]
+import requests
+from PIL import Image
+from io import BytesIO
+
+
+def fetch_image(url):
+    response = requests.get(url)
+    return Image.open(BytesIO(response.content)).convert("RGB")
+
+
+pil_image = fetch_image(url="http://farm3.staticflickr.com/2469/3915380994_2e611b1779_z.jpg")
+image = torch.from_numpy(numpy.array(pil_image)[:, :, [2, 1, 0]])
+image = torch.nn.functional.upsample(image.permute(2, 0, 1).unsqueeze(0).to(torch.float),
+                                     size=(800, 1280)  # size=(960, 1280))
+                                     ).to(torch.uint8).squeeze(0).permute(1, 2, 0).to('cpu')
+image = image.permute(2, 0, 1)
+input = [image.float(), image.float()]
+
+# ------------------------- fasterrcnn_resnet50_fpn
+
+model = torchvision.models.detection.faster_rcnn.fasterrcnn_resnet50_fpn(pretrained=True)
+export_and_check_model(model, 'faster_rcnn.onnx', input)
+
+# model = torchvision.models.detection.mask_rcnn.maskrcnn_resnet50_fpn(pretrained=True)
+# export_and_check_model(model, 'mask_rcnn.onnx', input)
+
+# model = torchvision.models.detection.keypoint_rcnn.keypointrcnn_resnet50_fpn(pretrained=True)
+# export_and_check_model(model, 'keypoint_rcnn.onnx', input)
 '''

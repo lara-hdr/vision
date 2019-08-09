@@ -85,13 +85,22 @@ class AnchorGenerator(nn.Module):
             grid_height, grid_width = size
             stride_height, stride_width = stride
             device = base_anchors.device
+
+            # onnx export :
+            # Type parameter (T) bound to different types (tensor(float) and tensor(int64)
+            stride_width = torch.tensor(stride_width, dtype=torch.float32)
+            stride_height = torch.tensor(stride_height, dtype=torch.float32)
+
             shifts_x = torch.arange(
                 0, grid_width, dtype=torch.float32, device=device
             ) * stride_width
             shifts_y = torch.arange(
                 0, grid_height, dtype=torch.float32, device=device
             ) * stride_height
-            shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+            # meshgrid will be supported by ONNX soon.
+            # shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+            shift_y = shifts_y.view(-1, 1).expand(grid_height, grid_width)
+            shift_x = shifts_x.view(1, -1).expand(grid_height, grid_width)
             shift_x = shift_x.reshape(-1)
             shift_y = shift_y.reshape(-1)
             shifts = torch.stack((shift_x, shift_y, shift_x, shift_y), dim=1)
@@ -299,7 +308,14 @@ class RegionProposalNetwork(torch.nn.Module):
         offset = 0
         for ob in objectness.split(num_anchors_per_level, 1):
             num_anchors = ob.shape[1]
-            pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
+            if torch._C._get_tracing_state():
+                from torch.onnx import operators
+                num_anchors = operators.shape_as_tensor(ob)[1].unsqueeze(0)
+                pre_nms_top_n = torch.min(torch.cat(
+                    (torch.tensor([self.pre_nms_top_n], dtype=torch.long),
+                     num_anchors), 0).type(torch.IntTensor)).type(torch.LongTensor)
+            else:
+                pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
             _, top_n_idx = ob.topk(pre_nms_top_n, dim=1)
             r.append(top_n_idx + offset)
             offset += num_anchors
@@ -395,10 +411,10 @@ class RegionProposalNetwork(torch.nn.Module):
                 testing, it is an empty dict.
         """
         # RPN uses all feature maps that are available
-        features = list(features.values())
+        if isinstance(features, dict):
+            features = list(features.values())
         objectness, pred_bbox_deltas = self.head(features)
         anchors = self.anchor_generator(images, features)
-
         num_images = len(anchors)
         num_anchors_per_level = [o[0].numel() for o in objectness]
         objectness, pred_bbox_deltas = \

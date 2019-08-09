@@ -67,7 +67,15 @@ class GeneralizedRCNNTransform(nn.Module):
         if max_size * scale_factor > self.max_size:
             scale_factor = self.max_size / max_size
         image = torch.nn.functional.interpolate(
-            image[None], scale_factor=scale_factor, mode='bilinear', align_corners=False)[0]
+            # !! Temp modification for testing purposes !!
+            #       !! This will NOT be checked in !!
+            #
+            # we are adding ONNX support for bilinear resize
+            # matching Pytorch's bilinear resize very soon.
+            #
+            # (+ mismatch bug with scale_factor when not int ?
+            # (testing with cases where scale_factor is an int for now))
+            image[None], scale_factor=scale_factor, mode='nearest')[0]  # align_corners=False
 
         if target is None:
             return image, target
@@ -96,6 +104,18 @@ class GeneralizedRCNNTransform(nn.Module):
         max_size[1] = int(math.ceil(float(max_size[1]) / stride) * stride)
         max_size[2] = int(math.ceil(float(max_size[2]) / stride) * stride)
         max_size = tuple(max_size)
+
+        # the line 'pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)'
+        # is not supported in onnx (indexing + inplace operation)
+        if torch._C._get_tracing_state():
+            padded_imgs = ()
+            for img in images:
+                padding = [int(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
+                padding = padding[1:]
+                padded_img = torch.nn.functional.pad(img, padding, "constant", 0)
+                padded_img = torch.unsqueeze(padded_img, 0)
+                padded_imgs = padded_imgs + tuple(padded_img)
+            return torch.stack(padded_imgs)
 
         batch_shape = (len(images),) + max_size
         batched_imgs = images[0].new(*batch_shape).zero_()
@@ -134,7 +154,14 @@ def resize_keypoints(keypoints, original_size, new_size):
 def resize_boxes(boxes, original_size, new_size):
     ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(new_size, original_size))
     ratio_height, ratio_width = ratios
-    xmin, ymin, xmax, ymax = boxes.unbind(1)
+
+    # unbind and lists not yet supported in ONNX.
+    # we are planning on adding support soon.
+    if torch._C._get_tracing_state():
+        xmin, ymin, xmax, ymax = [torch.squeeze(out, 1) for out in boxes.split(1, dim=1)]
+    else:
+        xmin, ymin, xmax, ymax = [torch.squeeze(out, 0) for out in boxes.unbind(1)]
+
     xmin = xmin * ratio_width
     xmax = xmax * ratio_width
     ymin = ymin * ratio_height

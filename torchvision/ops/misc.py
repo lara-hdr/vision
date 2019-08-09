@@ -145,7 +145,10 @@ class FrozenBatchNorm2d(torch.jit.ScriptModule):
         self.register_buffer("running_mean", torch.zeros(n))
         self.register_buffer("running_var", torch.ones(n))
 
-    @torch.jit.script_method
+    # Calling torch.jit.script_method when
+    # exporting a nn module is not supported
+    # with ONNX export
+    # @torch.jit.script_method
     def forward(self, x):
         # move reshapes to the beginning
         # to make it fuser-friendly
@@ -153,6 +156,8 @@ class FrozenBatchNorm2d(torch.jit.ScriptModule):
         b = self.bias.reshape(1, -1, 1, 1)
         rv = self.running_var.reshape(1, -1, 1, 1)
         rm = self.running_mean.reshape(1, -1, 1, 1)
-        scale = w * rv.rsqrt()
+        # !! This is only for testing !!
+        # we will be adding ONNX export support to rsqrt
+        scale = w * (torch.tensor(1., dtype=torch.float32) / rv.sqrt())
         bias = b - rm * scale
         return x * scale + bias

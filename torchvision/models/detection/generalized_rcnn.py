@@ -59,4 +59,8 @@ class GeneralizedRCNN(nn.Module):
         if self.training:
             return losses
 
+        # Tracing does not support dictionaries as output.
+        if torch._C._get_tracing_state():
+            if isinstance(detections[0], dict):
+                return [list(detection.values()) for detection in detections]
         return detections

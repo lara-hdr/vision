@@ -201,15 +201,27 @@ class BoxCoder(object):
         pred_w = torch.exp(dw) * widths[:, None]
         pred_h = torch.exp(dh) * heights[:, None]
 
-        pred_boxes = torch.zeros_like(rel_codes)
-        # x1
-        pred_boxes[:, 0::4] = pred_ctr_x - 0.5 * pred_w
-        # y1
-        pred_boxes[:, 1::4] = pred_ctr_y - 0.5 * pred_h
-        # x2
-        pred_boxes[:, 2::4] = pred_ctr_x + 0.5 * pred_w
-        # y2
-        pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h
+        if torch._C._get_tracing_state():
+            pred_boxes1 = pred_ctr_x - torch.tensor(0.5, dtype=torch.float32) * pred_w
+            pred_boxes2 = pred_ctr_y - torch.tensor(0.5, dtype=torch.float32) * pred_h
+            pred_boxes3 = pred_ctr_x + torch.tensor(0.5, dtype=torch.float32) * pred_w
+            pred_boxes4 = pred_ctr_y + torch.tensor(0.5, dtype=torch.float32) * pred_h
+            stack = torch.stack([pred_boxes1,
+                                 pred_boxes2,
+                                 pred_boxes3,
+                                 pred_boxes4],
+                                2)
+            pred_boxes = stack.view(rel_codes.shape)
+        else:
+            pred_boxes = torch.zeros_like(rel_codes)
+            # x1
+            pred_boxes[:, 0::4] = pred_ctr_x - 0.5 * pred_w
+            # y1
+            pred_boxes[:, 1::4] = pred_ctr_y - 0.5 * pred_h
+            # x2
+            pred_boxes[:, 2::4] = pred_ctr_x + 0.5 * pred_w
+            # y2
+            pred_boxes[:, 3::4] = pred_ctr_y + 0.5 * pred_h
 
         return pred_boxes
 
