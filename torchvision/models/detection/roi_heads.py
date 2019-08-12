@@ -259,20 +259,33 @@ def expand_boxes(boxes, scale):
     x_c = (boxes[:, 2] + boxes[:, 0]) * .5
     y_c = (boxes[:, 3] + boxes[:, 1]) * .5
 
-    w_half *= scale
-    h_half *= scale
+    if torch._C._get_tracing_state():
+        w_half = w_half.to(dtype=torch.float32)  * scale
+        h_half = h_half.to(dtype=torch.float32)  * scale
 
-    boxes_exp = torch.zeros_like(boxes)
-    boxes_exp[:, 0] = x_c - w_half
-    boxes_exp[:, 2] = x_c + w_half
-    boxes_exp[:, 1] = y_c - h_half
-    boxes_exp[:, 3] = y_c + h_half
+        boxes_exp0 = x_c - w_half
+        boxes_exp1 = y_c - h_half
+        boxes_exp2 = x_c + w_half
+        boxes_exp3 = y_c + h_half
+        boxes_exp = torch.stack((boxes_exp0, boxes_exp1, boxes_exp2, boxes_exp3), 1)
+    else:
+        w_half *= scale
+        h_half *= scale
+
+        boxes_exp = torch.zeros_like(boxes)
+        boxes_exp[:, 0] = x_c - w_half
+        boxes_exp[:, 2] = x_c + w_half
+        boxes_exp[:, 1] = y_c - h_half
+        boxes_exp[:, 3] = y_c + h_half
     return boxes_exp
 
 
 def expand_masks(mask, padding):
     M = mask.shape[-1]
-    scale = float(M + 2 * padding) / M
+    if torch._C._get_tracing_state():
+        scale = float(M + 2 * padding) / float(M)
+    else:
+        scale = float(M + 2 * padding) / M
     padded_mask = torch.nn.functional.pad(mask, (padding,) * 4)
     return padded_mask, scale
 
@@ -281,25 +294,34 @@ def paste_mask_in_image(mask, box, im_h, im_w):
     TO_REMOVE = 1
     w = int(box[2] - box[0] + TO_REMOVE)
     h = int(box[3] - box[1] + TO_REMOVE)
+
+    # min / max
     w = max(w, 1)
     h = max(h, 1)
 
     # Set shape to [batchxCxHxW]
-    mask = mask.expand((1, 1, -1, -1))
+    if torch._C._get_tracing_state():
+        mask = mask.expand((1, 1, mask.shape[0], mask.shape[1]))
+    else:
+        mask = mask.expand((1, 1, -1, -1))
 
     # Resize mask
-    mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False)
+    mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='nearest')  # bilinear', align_corners=False)
     mask = mask[0][0]
 
-    im_mask = torch.zeros((im_h, im_w), dtype=mask.dtype, device=mask.device)
+    # min / max
     x_0 = max(box[0], 0)
     x_1 = min(box[2] + 1, im_w)
     y_0 = max(box[1], 0)
     y_1 = min(box[3] + 1, im_h)
 
-    im_mask[y_0:y_1, x_0:x_1] = mask[
-        (y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])
-    ]
+    if torch._C._get_tracing_state():
+        unpaded_im_mask =  mask[(y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])]
+        padding = (y_0, x_0, int(im_h - y_1), int(im_w - x_1))
+        im_mask = torch.nn.functional.pad(unpaded_im_mask, padding, "constant", 0)
+    else:
+        im_mask = torch.zeros((im_h, im_w), dtype=mask.dtype, device=mask.device)
+        im_mask[y_0:y_1, x_0:x_1] = mask[(y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])]
     return im_mask
 
 
