@@ -13,17 +13,23 @@ def nms(boxes, scores, iou_threshold):
     IoU greater than iou_threshold with another (higher scoring)
     box.
 
-    Arguments:
-        boxes (Tensor[N, 4]): boxes to perform NMS on. They
-            are expected to be in (x1, y1, x2, y2) format
-        scores (Tensor[N]): scores for each one of the boxes
-        iou_threshold (float): discards all overlapping
-            boxes with IoU < iou_threshold
+    Parameters
+    ----------
+    boxes : Tensor[N, 4])
+        boxes to perform NMS on. They
+        are expected to be in (x1, y1, x2, y2) format
+    scores : Tensor[N]
+        scores for each one of the boxes
+    iou_threshold : float
+        discards all overlapping
+        boxes with IoU < iou_threshold
 
-    Returns:
-        keep (Tensor): int64 tensor with the indices
-            of the elements that have been kept
-            by NMS, sorted in decreasing order of scores
+    Returns
+    -------
+    keep : Tensor
+        int64 tensor with the indices
+        of the elements that have been kept
+        by NMS, sorted in decreasing order of scores
     """
 
     if torch._C._get_tracing_state():
@@ -40,19 +46,25 @@ def batched_nms(boxes, scores, idxs, iou_threshold):
     Each index value correspond to a category, and NMS
     will not be applied between elements of different categories.
 
-    Arguments:
-        boxes (Tensor[N, 4]): boxes where NMS will be performed. They
-            are expected to be in (x1, y1, x2, y2) format
-        scores (Tensor[N]): scores for each one of the boxes
-        idxs (Tensor[N]): indices of the categories for each
-            one of the boxes.
-        iou_threshold (float): discards all overlapping boxes
-            with IoU < iou_threshold
+    Parameters
+    ----------
+    boxes : Tensor[N, 4]
+        boxes where NMS will be performed. They
+        are expected to be in (x1, y1, x2, y2) format
+    scores : Tensor[N]
+        scores for each one of the boxes
+    idxs : Tensor[N]
+        indices of the categories for each one of the boxes.
+    iou_threshold : float
+        discards all overlapping boxes
+        with IoU < iou_threshold
 
-    Returns:
-        keep (Tensor): int64 tensor with the indices of
-            the elements that have been kept by NMS, sorted
-            in decreasing order of scores
+    Returns
+    -------
+    keep : Tensor
+        int64 tensor with the indices of
+        the elements that have been kept by NMS, sorted
+        in decreasing order of scores
     """
     if boxes.numel() == 0:
         return torch.empty((0,), dtype=torch.int64, device=boxes.device)
