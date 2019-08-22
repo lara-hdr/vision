@@ -33,16 +33,14 @@ def register_custom_op():
                     output_width_i=pooled_width,
                     sampling_ratio_i=sampling_ratio)
 
-    @parse_args('v', 'v', 'i', 'i', 'f')
-    def roi_pool(g, input, rois, pooled_height, pooled_width, spatial_scale):
+    @parse_args('v', 'v', 'f', 'i', 'i')
+    def roi_pool(g, input, rois, spatial_scale, pooled_height, pooled_width):
         roi_pool = g.op('MaxRoiPool',
                         input,
                         rois,
                         pooled_shape_i=(pooled_height, pooled_width),
                         spatial_scale_f=spatial_scale)
-        argmax = g.op('ArgMax', roi_pool, axis_i=0, keepdims_i=False)
-        argmax = g.op("Cast", argmax, to_i=scalar_type_to_onnx[3])
-        return roi_pool, argmax
+        return roi_pool, None
 
     from torch.onnx import register_custom_op_symbolic
     register_custom_op_symbolic('torchvision::nms', symbolic_multi_label_nms, 10)

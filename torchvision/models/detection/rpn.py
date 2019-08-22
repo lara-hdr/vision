@@ -98,9 +98,11 @@ class AnchorGenerator(nn.Module):
                 0, grid_height, dtype=torch.float32, device=device
             ) * stride_height
             # meshgrid will be supported by ONNX soon.
-            # shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
-            shift_y = shifts_y.view(-1, 1).expand(grid_height, grid_width)
-            shift_x = shifts_x.view(1, -1).expand(grid_height, grid_width)
+            if torch._C._get_tracing_state():
+                shift_y = shifts_y.view(-1, 1).expand(grid_height, grid_width)
+                shift_x = shifts_x.view(1, -1).expand(grid_height, grid_width)
+            else:
+                shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
             shift_x = shift_x.reshape(-1)
             shift_y = shift_y.reshape(-1)
             shifts = torch.stack((shift_x, shift_y, shift_x, shift_y), dim=1)
@@ -126,6 +128,7 @@ class AnchorGenerator(nn.Module):
         self.set_cell_anchors(feature_maps[0].device)
         anchors_over_all_feature_maps = self.cached_grid_anchors(grid_sizes, strides)
         anchors = []
+        # fails when image sizes is different with new input
         for i, (image_height, image_width) in enumerate(image_list.image_sizes):
             anchors_in_image = []
             for anchors_per_feature_map in anchors_over_all_feature_maps:
@@ -345,7 +348,7 @@ class RegionProposalNetwork(torch.nn.Module):
         final_boxes = []
         final_scores = []
         for boxes, scores, lvl, img_shape in zip(proposals, objectness, levels, image_shapes):
-            boxes = box_ops.clip_boxes_to_image(boxes, img_shape)
+            boxes = box_ops.clip_boxes_to_image(boxes, img_shape) # 5 % mismatch happening here
             keep = box_ops.remove_small_boxes(boxes, self.min_size)
             boxes, scores, lvl = boxes[keep], scores[keep], lvl[keep]
             # non-maximum suppression, independently done per level

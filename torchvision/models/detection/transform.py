@@ -97,32 +97,44 @@ class GeneralizedRCNNTransform(nn.Module):
 
     def batch_images(self, images, size_divisible=32):
         # concatenate
-        max_size = tuple(max(s) for s in zip(*[img.shape for img in images]))
-
-        stride = size_divisible
-        max_size = list(max_size)
-        max_size[1] = int(math.ceil(float(max_size[1]) / stride) * stride)
-        max_size[2] = int(math.ceil(float(max_size[2]) / stride) * stride)
-        max_size = tuple(max_size)
+        if torch._C._get_tracing_state():
+            max_size = tuple(torch.max(torch.tensor(s), dim=0, keepdim=True)[0] for s in zip(*[img.shape for img in images]))
+            max_size = list(max_size)
+            stride = size_divisible
+            max_size[1] = (torch.ceil(torch.tensor(max_size[1], dtype=torch.float32) / stride) * stride).to(dtype=torch.int64)
+            max_size[2] = (torch.ceil(torch.tensor(max_size[2], dtype=torch.float32) / stride) * stride).to(dtype=torch.int64)
+            max_size = tuple(max_size)
+        else:
+            max_size = tuple(max(s) for s in zip(*[img.shape for img in images]))
+            max_size = list(max_size)
+            stride = size_divisible
+            max_size[1] = int(math.ceil(float(max_size[1]) / stride) * stride)
+            max_size[2] = int(math.ceil(float(max_size[2]) / stride) * stride)
+            max_size = tuple(max_size)
 
         # the line 'pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)'
         # is not supported in onnx (indexing + inplace operation)
         if torch._C._get_tracing_state():
             padded_imgs = ()
             for img in images:
+                #print("\n\n", max_size, tuple(img.shape),"\n\n", )
                 padding = [int(s1 - s2) for s1, s2 in zip(max_size, tuple(img.shape))]
-                padding = padding[1:]
-                padded_img = torch.nn.functional.pad(img, padding, "constant", 0)
-                padded_img = torch.unsqueeze(padded_img, 0)
+                zeros_0 = torch.zeros(padding[0], img.shape[1], img.shape[2])
+                concat_0 = torch.cat((img, zeros_0), 0)
+                zeros_1 = torch.zeros(concat_0.shape[0], padding[1], concat_0.shape[2])
+                concat_1 = torch.cat((concat_0, zeros_1), 1)
+                zeros_2 = torch.zeros(concat_1.shape[0], concat_1.shape[1], padding[2])
+                concat_2 = torch.cat((concat_1, zeros_2), 2)
+                padded_img = torch.unsqueeze(concat_2, 0)
                 padded_imgs = padded_imgs + tuple(padded_img)
             return torch.stack(padded_imgs)
-
-        batch_shape = (len(images),) + max_size
-        batched_imgs = images[0].new(*batch_shape).zero_()
-        for img, pad_img in zip(images, batched_imgs):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-
-        return batched_imgs
+        else:
+            batch_shape = (len(images),) + max_size
+            batched_imgs = images[0].new(*batch_shape).zero_()
+            for img, pad_img in zip(images, batched_imgs):
+                pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+            print("batched_imgs   " , batched_imgs.shape)
+            return batched_imgs
 
     def postprocess(self, result, image_shapes, original_image_sizes):
         if self.training:
@@ -146,8 +158,13 @@ def resize_keypoints(keypoints, original_size, new_size):
     ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(new_size, original_size))
     ratio_h, ratio_w = ratios
     resized_data = keypoints.clone()
-    resized_data[..., 0] *= ratio_w
-    resized_data[..., 1] *= ratio_h
+    if torch._C._get_tracing_state():
+        resized_data_0 = resized_data[:, :, 0] * ratio_w
+        resized_data_1 = resized_data[:, :, 1] * ratio_h
+        resized_data = torch.stack((resized_data_0, resized_data_1, resized_data[:, :, 2]), dim=2)
+    else:
+        resized_data[..., 0] *= ratio_w
+        resized_data[..., 1] *= ratio_h
     return resized_data
 
 
