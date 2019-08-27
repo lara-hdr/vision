@@ -45,6 +45,8 @@ class Conv2d(torch.nn.Conv2d):
             )
         ]
         output_shape = [x.shape[0], self.weight.shape[0]] + output_shape
+        if torch._C._get_tracing_state():
+            return x.new_empty(output_shape)
         return _NewEmptyTensorOp.apply(x, output_shape)
 
 
@@ -71,6 +73,8 @@ class ConvTranspose2d(torch.nn.ConvTranspose2d):
             )
         ]
         output_shape = [x.shape[0], self.bias.shape[0]] + output_shape
+        if torch._C._get_tracing_state():
+            return x.new_empty(output_shape)
         return _NewEmptyTensorOp.apply(x, output_shape)
 
 
@@ -85,6 +89,8 @@ class BatchNorm2d(torch.nn.BatchNorm2d):
             return super(BatchNorm2d, self).forward(x)
         # get output shape
         output_shape = x.shape
+        if torch._C._get_tracing_state():
+            return x.new_empty(output_shape)
         return _NewEmptyTensorOp.apply(x, output_shape)
 
 
@@ -128,6 +134,8 @@ def interpolate(
 
     output_shape = tuple(_output_size(2))
     output_shape = input.shape[:-2] + output_shape
+    if torch._C._get_tracing_state():
+        return input.new_empty(output_shape)
     return _NewEmptyTensorOp.apply(input, output_shape)
 
 

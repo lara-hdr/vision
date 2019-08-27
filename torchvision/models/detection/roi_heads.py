@@ -158,6 +158,59 @@ def keypoints_to_heatmap(keypoints, rois, heatmap_size):
 
     return heatmaps, valid
 
+#@torch.script
+def heatmaps_to_keypoints_looping(rois,
+                                  maps,
+                                  num_keypoints,
+                                  widths_ceil,
+                                  heights_ceil,
+                                  widths,
+                                  heights,
+                                  offset_x,
+                                  offset_y):
+    xy_preds = torch.zeros((len(rois), 3, num_keypoints), dtype=torch.float32, device=maps.device)
+    end_scores = torch.zeros((len(rois), num_keypoints), dtype=torch.float32, device=maps.device)
+    for i in range(len(rois)):
+        if torch._C._get_tracing_state():
+            roi_map_width = widths_ceil[i]
+            roi_map_height = heights_ceil[i]
+        else:
+            roi_map_width = int(widths_ceil[i].item())
+            roi_map_height = int(heights_ceil[i].item())
+        width_correction = widths[i] / roi_map_width
+        height_correction = heights[i] / roi_map_height
+        roi_map = torch.nn.functional.interpolate(
+            maps[i][None], size=(roi_map_height, roi_map_width), mode='bicubic', align_corners=False)[0]
+        # roi_map_probs = scores_to_probs(roi_map.copy())
+        w = roi_map.shape[2]
+        pos = roi_map.reshape(num_keypoints, -1).argmax(dim=1)
+        x_int = pos % w
+        y_int = (pos - x_int) // w
+        # assert (roi_map_probs[k, y_int, x_int] ==
+        #         roi_map_probs[k, :, :].max())
+        x = (x_int.float() + 0.5) * width_correction
+        y = (y_int.float() + 0.5) * height_correction
+
+        if torch._C._get_tracing_state():
+            xy_preds_i_0 = x + offset_x[i]
+            xy_preds_i_1 = y + offset_y[i]
+            xy_preds_i_2 = torch.full(tuple([num_keypoints]), 1).to(dtype=torch.float32)
+            xy_preds_i = torch.stack((xy_preds_i_0, xy_preds_i_1, xy_preds_i_2))
+            xy_preds_list.append(xy_preds_i)
+            # arange traced as cste workaround
+            temp = torch.squeeze(torch.ones(num_keypoints).nonzero())
+            end_scores_i = roi_map[temp, y_int, x_int]
+            end_scores_list.append(end_scores_i)
+        else:
+            xy_preds[i, 0, :] = x + offset_x[i]
+            xy_preds[i, 1, :] = y + offset_y[i]
+            xy_preds[i, 2, :] = 1
+            end_scores[i, :] = roi_map[torch.arange(num_keypoints), y_int, x_int]
+    
+    if torch._C._get_tracing_state():
+        xy_preds = torch.stack(xy_preds_list)
+        end_scores = torch.stack(end_scores_list)
+    return xy_preds, end_scores
 
 def heatmaps_to_keypoints(maps, rois):
     """Extract predicted keypoint locations from heatmaps. Output has shape
@@ -176,33 +229,13 @@ def heatmaps_to_keypoints(maps, rois):
     heights = rois[:, 3] - rois[:, 1]
     widths = widths.clamp(min=1)
     heights = heights.clamp(min=1)
-    widths_ceil = widths.ceil()
-    heights_ceil = heights.ceil()
+    widths_ceil = torch.ceil(widths)
+    heights_ceil = torch.ceil(heights)
 
     num_keypoints = maps.shape[1]
-    xy_preds = torch.zeros((len(rois), 3, num_keypoints), dtype=torch.float32, device=maps.device)
-    end_scores = torch.zeros((len(rois), num_keypoints), dtype=torch.float32, device=maps.device)
-    for i in range(len(rois)):
-        roi_map_width = int(widths_ceil[i].item())
-        roi_map_height = int(heights_ceil[i].item())
-        width_correction = widths[i] / roi_map_width
-        height_correction = heights[i] / roi_map_height
-        roi_map = torch.nn.functional.interpolate(
-            maps[i][None], size=(roi_map_height, roi_map_width), mode='bicubic', align_corners=False)[0]
-        # roi_map_probs = scores_to_probs(roi_map.copy())
-        w = roi_map.shape[2]
-        pos = roi_map.reshape(num_keypoints, -1).argmax(dim=1)
-        x_int = pos % w
-        y_int = (pos - x_int) // w
-        # assert (roi_map_probs[k, y_int, x_int] ==
-        #         roi_map_probs[k, :, :].max())
-        x = (x_int.float() + 0.5) * width_correction
-        y = (y_int.float() + 0.5) * height_correction
-        xy_preds[i, 0, :] = x + offset_x[i]
-        xy_preds[i, 1, :] = y + offset_y[i]
-        xy_preds[i, 2, :] = 1
-        end_scores[i, :] = roi_map[torch.arange(num_keypoints), y_int, x_int]
-
+    
+    xy_preds, end_scores = heatmaps_to_keypoints_looping(rois, maps, num_keypoints,
+                                  widths_ceil, heights_ceil, widths, heights, offset_x, offset_y)
     return xy_preds.permute(0, 2, 1), end_scores
 
 
@@ -259,14 +292,21 @@ def expand_boxes(boxes, scale):
     x_c = (boxes[:, 2] + boxes[:, 0]) * .5
     y_c = (boxes[:, 3] + boxes[:, 1]) * .5
 
-    w_half *= scale
-    h_half *= scale
+    w_half = w_half.to(dtype=torch.float32) * torch.tensor(scale)
+    h_half = h_half.to(dtype=torch.float32) * torch.tensor(scale)
 
-    boxes_exp = torch.zeros_like(boxes)
-    boxes_exp[:, 0] = x_c - w_half
-    boxes_exp[:, 2] = x_c + w_half
-    boxes_exp[:, 1] = y_c - h_half
-    boxes_exp[:, 3] = y_c + h_half
+    if torch._C._get_tracing_state():
+        boxes_exp0 = x_c - w_half
+        boxes_exp1 = y_c - h_half
+        boxes_exp2 = x_c + w_half
+        boxes_exp3 = y_c + h_half
+        boxes_exp = torch.stack((boxes_exp0, boxes_exp1, boxes_exp2, boxes_exp3), 1)
+    else:
+        boxes_exp = torch.zeros_like(boxes)
+        boxes_exp[:, 0] = x_c - w_half
+        boxes_exp[:, 2] = x_c + w_half
+        boxes_exp[:, 1] = y_c - h_half
+        boxes_exp[:, 3] = y_c + h_half
     return boxes_exp
 
 
