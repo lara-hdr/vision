@@ -10,18 +10,18 @@ from torchvision.ops.boxes import box_area
 def merge_levels_onnx(levels, unmerged_results):
     first_result = unmerged_results[0]
     dtype, device = first_result.dtype, first_result.device
-    zeros_size = (levels.size(0).item(), first_result.size(1).item(),
-                  first_result.size(2).item(), first_result.size(3).item())
+    zeros_size = (levels.size(0), first_result.size(1),
+                  first_result.size(2), first_result.size(3))
     res = torch.zeros(zeros_size,
                       dtype=dtype, device=device)
 
     for l in range(len(unmerged_results)):
         index = (levels == torch.full_like(levels, l)).nonzero().view(-1, 1, 1, 1)
         # WORK AROUND: masked_scatter_ not in ONNX
-        index = index.expand(index.size(0).item(),
-                             unmerged_results[l].size(1).item(),
-                             unmerged_results[l].size(2).item(),
-                             unmerged_results[l].size(3).item()).to(torch.long)
+        index = index.expand(index.size(0),
+                             unmerged_results[l].size(1),
+                             unmerged_results[l].size(2),
+                             unmerged_results[l].size(3)).to(torch.long)
         res.scatter_(0, index, unmerged_results[l])
     return res
 
@@ -106,7 +106,7 @@ class MultiScaleRoIAlign(nn.Module):
         device, dtype = concat_boxes.device, concat_boxes.dtype
         ids = torch.cat(
             [
-                torch.full((len(b), 1), i, dtype=dtype, device=device)
+                torch.full_like(b[:, :1], i)
                 for i, b in enumerate(boxes)
             ],
             dim=0,
@@ -181,19 +181,12 @@ class MultiScaleRoIAlign(nn.Module):
             self.setup_scales(x, image_shapes)
 
         if num_levels == 1:
-            if torch._C._get_tracing_state():
-                return torch.ops.torchvision.roi_align_forward(
-                    x[0], rois, self.scales[0],
-                    self.output_size[0],
-                    self.output_size[1],
-                    self.sampling_ratio)
-            else:
-                return roi_align(
-                    x[0], rois,
-                    output_size=self.output_size,
-                    spatial_scale=self.scales[0],
-                    sampling_ratio=self.sampling_ratio
-                )
+            return roi_align(
+                x[0], rois,
+                output_size=self.output_size,
+                spatial_scale=self.scales[0],
+                sampling_ratio=self.sampling_ratio
+            )
 
         levels = self.map_levels(boxes)
 
@@ -213,11 +206,10 @@ class MultiScaleRoIAlign(nn.Module):
             rois_per_level = rois[idx_in_level]
 
             if torch._C._get_tracing_state():
-                unmerged_results.append(torch.ops.torchvision.roi_align_forward(
-                    per_level_feature, rois_per_level, scale,
-                    self.output_size[0],
-                    self.output_size[1],
-                    self.sampling_ratio
+                unmerged_results.append(roi_align(
+                    per_level_feature, rois_per_level,
+                    output_size=self.output_size,
+                    spatial_scale=scale, sampling_ratio=self.sampling_ratio
                 ).to(dtype))
                 result = merge_levels_onnx(levels, unmerged_results)
             else:
