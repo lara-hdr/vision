@@ -68,9 +68,11 @@ def maskrcnn_inference(x, labels):
 
     # select masks coresponding to the predicted classes
     num_masks = x.shape[0]
-    boxes_per_image = [len(l) for l in labels]
+    boxes_per_image = [l.size()[0] for l in labels]
     labels = torch.cat(labels)
-    index = torch.arange(num_masks, device=labels.device)
+    # arange traced as constant. wrok around for now.
+    # index = torch.arange(num_masks, device=labels.device)
+    index = torch.squeeze(torch.ones(x.size()[0]).nonzero())
     mask_prob = mask_prob[index, labels][:, None]
 
     mask_prob = mask_prob.split(boxes_per_image, dim=0)
@@ -272,46 +274,66 @@ def expand_boxes(boxes, scale):
 
 def expand_masks(mask, padding):
     M = mask.shape[-1]
-    scale = float(M + 2 * padding) / M
+    scale = float(M + 2 * padding) / float(M)
     padded_mask = torch.nn.functional.pad(mask, (padding,) * 4)
     return padded_mask, scale
 
 
 def paste_mask_in_image(mask, box, im_h, im_w):
     TO_REMOVE = 1
-    w = int(box[2] - box[0] + TO_REMOVE)
-    h = int(box[3] - box[1] + TO_REMOVE)
-    w = max(w, 1)
-    h = max(h, 1)
+
+    w = torch.tensor([(box[2] - box[0] + TO_REMOVE)], dtype=torch.int64)
+    h = torch.tensor([(box[3] - box[1] + TO_REMOVE)], dtype=torch.int64)
+    w = torch.max(torch.cat((w, torch.tensor([1])), 0))
+    h = torch.max(torch.cat((h, torch.tensor([1])), 0))
 
     # Set shape to [batchxCxHxW]
-    mask = mask.expand((1, 1, -1, -1))
+    mask = mask.expand((1, 1, mask.shape[0], mask.shape[1]))
 
     # Resize mask
     mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False)
     mask = mask[0][0]
 
-    im_mask = torch.zeros((im_h, im_w), dtype=mask.dtype, device=mask.device)
-    x_0 = max(box[0], 0)
-    x_1 = min(box[2] + 1, im_w)
-    y_0 = max(box[1], 0)
-    y_1 = min(box[3] + 1, im_h)
+    x_0 = torch.max(torch.cat((torch.tensor([box[0]]), torch.tensor([0])), 0))
+    x_1 = torch.min(torch.cat((torch.tensor([box[2] + 1]), torch.tensor([im_w])), 0))
+    y_0 = torch.max(torch.cat((torch.tensor([box[1]]), torch.tensor([0])), 0))
+    y_1 = torch.min(torch.cat((torch.tensor([box[3] + 1]), torch.tensor([im_h])), 0))
 
-    im_mask[y_0:y_1, x_0:x_1] = mask[
-        (y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])
-    ]
+    if torch._C._get_tracing_state():
+        unpaded_im_mask =  mask[(y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])]
+
+        zeros_y0 = torch.zeros(y_0, unpaded_im_mask.shape[1])
+        zeros_y1 = torch.zeros(im_h - y_1, unpaded_im_mask.shape[1])
+        concat_0 = torch.cat((zeros_y0, unpaded_im_mask, zeros_y1), 0)
+
+        zeros_x0 = torch.zeros(concat_0.shape[0], x_0)
+        zeros_x1 = torch.zeros(concat_0.shape[0], im_w - x_1)
+        im_mask = torch.cat((zeros_x0, concat_0, zeros_x1), 1)
+    else:
+        im_mask = torch.zeros((im_h, im_w), dtype=mask.dtype, device=mask.device)
+        im_mask[y_0:y_1, x_0:x_1] = mask[
+            (y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])
+        ]
     return im_mask
 
+#@torch.jit.script
+def paste_masks_in_image_loop(masks, boxes, im_h, im_w):
+    boxes_list = boxes.tolist() # [boxes_list[i] for i in range(boxes.size()[0])]
+    res = []
+    for m, b in zip(masks, boxes_list):
+        res.append(paste_mask_in_image(m[0], b, im_h, im_w))
+    return res
 
 def paste_masks_in_image(masks, boxes, img_shape, padding=1):
     masks, scale = expand_masks(masks, padding=padding)
-    boxes = expand_boxes(boxes, scale).to(dtype=torch.int64).tolist()
+    boxes = expand_boxes(boxes, scale).to(dtype=torch.int64)#.tolist()
     # im_h, im_w = img_shape.tolist()
     im_h, im_w = img_shape
-    res = [
-        paste_mask_in_image(m[0], b, im_h, im_w)
-        for m, b in zip(masks, boxes)
-    ]
+    #res = [
+    #    paste_mask_in_image(m[0], b, im_h, im_w)
+    #    for m, b in zip(masks, boxes)
+    #]
+    res = paste_masks_in_image_loop(masks, boxes, torch.tensor(im_h), torch.tensor(im_w))
     if len(res) > 0:
         res = torch.stack(res, dim=0)[:, None]
     else:
