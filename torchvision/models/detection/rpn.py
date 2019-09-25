@@ -7,6 +7,28 @@ from torchvision.ops import boxes as box_ops
 
 from . import _utils as det_utils
 
+'''@torch.jit.script
+def _get_top_n_idx_script(objectness, num_anchors_per_level, self_pre_nms_top_n):
+    # type: (Tensor, List[int], int) -> Tensor
+    r = []
+    offset = 0
+    for ob in objectness.split(num_anchors_per_level, 1):
+        #from torch.onnx import operators
+        #num_anchors = operators.shape_as_tensor(ob)[1].unsqueeze(0)
+        #pre_nms_top_n = torch.min(torch.cat(
+        #    (torch.tensor([self_pre_nms_top_n], dtype=num_anchors.dtype),
+        #    num_anchors), 0).to(torch.int32)).to(num_anchors.dtype)
+        num_anchors = ob.shape[1]
+        #pre_nms_top_n = min(self_pre_nms_top_n, num_anchors)
+        first =torch.tensor([self_pre_nms_top_n], dtype=torch.float32)
+        second = torch._shape_as_tensor(ob)[1].unsqueeze(0).to(torch.float32)
+        pre_nms_top_n = torch.min(torch.cat((first, second)))
+        #_, top_n_idx = torch.topk(ob.to(torch.float), pre_nms_top_n.to(torch.long), dim=1)
+        _, top_n_idx = ob.topk(pre_nms_top_n.to(torch.int32), dim=1)
+        #print((top_n_idx +offset).shape)
+        r.append(top_n_idx + offset)
+        #offset += num_anchors
+    return torch.cat(r, dim=1)'''
 
 class AnchorGenerator(nn.Module):
     """
@@ -49,9 +71,9 @@ class AnchorGenerator(nn.Module):
         self._cache = {}
 
     @staticmethod
-    def generate_anchors(scales, aspect_ratios, device="cpu"):
-        scales = torch.as_tensor(scales, dtype=torch.float32, device=device)
-        aspect_ratios = torch.as_tensor(aspect_ratios, dtype=torch.float32, device=device)
+    def generate_anchors(scales, aspect_ratios, dtype=torch.float32, device="cpu"):
+        scales = torch.as_tensor(scales, dtype=dtype, device=device)
+        aspect_ratios = torch.as_tensor(aspect_ratios, dtype=dtype, device=device)
         h_ratios = torch.sqrt(aspect_ratios)
         w_ratios = 1 / h_ratios
 
@@ -61,13 +83,14 @@ class AnchorGenerator(nn.Module):
         base_anchors = torch.stack([-ws, -hs, ws, hs], dim=1) / 2
         return base_anchors.round()
 
-    def set_cell_anchors(self, device):
+    def set_cell_anchors(self, dtype, device):
         if self.cell_anchors is not None:
             return self.cell_anchors
         cell_anchors = [
             self.generate_anchors(
                 sizes,
                 aspect_ratios,
+                dtype,
                 device
             )
             for sizes, aspect_ratios in zip(self.sizes, self.aspect_ratios)
@@ -85,13 +108,19 @@ class AnchorGenerator(nn.Module):
             grid_height, grid_width = size
             stride_height, stride_width = stride
             device = base_anchors.device
+            stride_width = torch.tensor(stride_width, dtype=torch.float32)
+            stride_height = torch.tensor(stride_height, dtype=torch.float32)
             shifts_x = torch.arange(
                 0, grid_width, dtype=torch.float32, device=device
             ) * stride_width
             shifts_y = torch.arange(
                 0, grid_height, dtype=torch.float32, device=device
-            ) * stride_height
-            shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
+            ) * stride_height     
+            #if torch._C._get_tracing_state():
+            shift_y = shifts_y.view(-1, 1).expand(grid_height, grid_width)
+            shift_x = shifts_x.view(1, -1).expand(grid_height, grid_width)
+            #else:
+            #    shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x)
             shift_x = shift_x.reshape(-1)
             shift_y = shift_y.reshape(-1)
             shifts = torch.stack((shift_x, shift_y, shift_x, shift_y), dim=1)
@@ -113,8 +142,11 @@ class AnchorGenerator(nn.Module):
     def forward(self, image_list, feature_maps):
         grid_sizes = tuple([feature_map.shape[-2:] for feature_map in feature_maps])
         image_size = image_list.tensors.shape[-2:]
-        strides = tuple((image_size[0] / g[0], image_size[1] / g[1]) for g in grid_sizes)
-        self.set_cell_anchors(feature_maps[0].device)
+        strides = tuple((float(float(image_size[0]) / float(g[0])),
+                        float(float(image_size[1]) / float(g[1])))
+                  for g in grid_sizes)
+        dtype, device = feature_maps[0].dtype, feature_maps[0].device
+        self.set_cell_anchors(dtype, device)
         anchors_over_all_feature_maps = self.cached_grid_anchors(grid_sizes, strides)
         anchors = []
         for i, (image_height, image_width) in enumerate(image_list.image_sizes):
@@ -298,9 +330,20 @@ class RegionProposalNetwork(torch.nn.Module):
         r = []
         offset = 0
         for ob in objectness.split(num_anchors_per_level, 1):
-            num_anchors = ob.shape[1]
-            pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
-            _, top_n_idx = ob.topk(pre_nms_top_n, dim=1)
+            if torch._C._get_tracing_state():
+                from torch.onnx import operators
+                num_anchors = operators.shape_as_tensor(ob)[1].unsqueeze(0)
+                # TODO : remove cast to IntTensor/num_anchors.dtype when
+                #        ONNX Runtime version is updated with ReduceMin int64 support
+                pre_nms_top_n = torch.min(torch.cat(
+                    (torch.tensor([self.pre_nms_top_n], dtype=num_anchors.dtype),
+                    num_anchors), 0).to(torch.int32)).to(num_anchors.dtype)
+            else:
+                num_anchors = ob.shape[1]
+                pre_nms_top_n = min(self.pre_nms_top_n, num_anchors)
+                pre_nms_top_n = torch.tensor(pre_nms_top_n)
+            # top_n_idx 0.4% msm 
+            _, top_n_idx = torch.topk(ob.to(torch.float), pre_nms_top_n.to(torch.long), dim=1)
             r.append(top_n_idx + offset)
             offset += num_anchors
         return torch.cat(r, dim=1)
@@ -320,7 +363,13 @@ class RegionProposalNetwork(torch.nn.Module):
         levels = levels.reshape(1, -1).expand_as(objectness)
 
         # select top_n boxes independently per level before applying nms
+        #print("\n\n\n",type(objectness), type(num_anchors_per_level[0]), type(self.pre_nms_top_n))
         top_n_idx = self._get_top_n_idx(objectness, num_anchors_per_level)
+        #top_n_idx = _get_top_n_idx_script(objectness, num_anchors_per_level, self.pre_nms_top_n)
+
+        #print("\n\n\n\n::: ", top_n_idx.shape)
+        #return top_n_idx, top_n_idx
+
         batch_idx = torch.arange(num_images, device=device)[:, None]
         objectness = objectness[batch_idx, top_n_idx]
         levels = levels[batch_idx, top_n_idx]
@@ -410,6 +459,7 @@ class RegionProposalNetwork(torch.nn.Module):
         proposals = proposals.view(num_images, -1, 4)
         boxes, scores = self.filter_proposals(proposals, objectness, images.image_sizes, num_anchors_per_level)
 
+        #return boxes, scores
         losses = {}
         if self.training:
             labels, matched_gt_boxes = self.assign_targets_to_anchors(anchors, targets)

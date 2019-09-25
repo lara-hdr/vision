@@ -70,10 +70,14 @@ def maskrcnn_inference(x, labels):
     num_masks = x.shape[0]
     boxes_per_image = [len(l) for l in labels]
     labels = torch.cat(labels)
-    index = torch.arange(num_masks, device=labels.device)
+    index = torch.squeeze(torch.ones(x.size()[0]).nonzero()) # torch.arange(num_masks, device=labels.device)
     mask_prob = mask_prob[index, labels][:, None]
+    #print(mask_prob.size())
 
-    mask_prob = mask_prob.split(boxes_per_image, dim=0)
+    if torch._C._get_tracing_state():
+        mask_prob = (mask_prob,)
+    else:
+        mask_prob = mask_prob.split(boxes_per_image, dim=0)
 
     return mask_prob
 
@@ -249,11 +253,30 @@ def keypointrcnn_inference(x, boxes):
 
     return kp_probs, kp_scores
 
+def _onnx_expand_boxes(boxes, scale):
+    w_half = (boxes[:, 2] - boxes[:, 0]) * .5
+    h_half = (boxes[:, 3] - boxes[:, 1]) * .5
+    x_c = (boxes[:, 2] + boxes[:, 0]) * .5
+    y_c = (boxes[:, 3] + boxes[:, 1]) * .5
+
+    w_half = w_half.to(dtype=torch.float32)  * torch.tensor(scale)
+    h_half = h_half.to(dtype=torch.float32)  * torch.tensor(scale)
+    boxes_exp0 = x_c - w_half
+    boxes_exp1 = y_c - h_half
+    boxes_exp2 = x_c + w_half
+    boxes_exp3 = y_c + h_half
+    boxes_exp = torch.stack((boxes_exp0, boxes_exp1, boxes_exp2, boxes_exp3), 1)
+
+    return boxes_exp
 
 # the next two functions should be merged inside Masker
 # but are kept here for the moment while we need them
 # temporarily for paste_mask_in_image
 def expand_boxes(boxes, scale):
+    # comment
+    if torch._C._get_tracing_state():
+        return _onnx_expand_boxes(boxes, scale)
+
     w_half = (boxes[:, 2] - boxes[:, 0]) * .5
     h_half = (boxes[:, 3] - boxes[:, 1]) * .5
     x_c = (boxes[:, 2] + boxes[:, 0]) * .5
@@ -272,12 +295,183 @@ def expand_boxes(boxes, scale):
 
 def expand_masks(mask, padding):
     M = mask.shape[-1]
-    scale = float(M + 2 * padding) / M
+    scale = float(M + 2 * padding) / float(M)
     padded_mask = torch.nn.functional.pad(mask, (padding,) * 4)
     return padded_mask, scale
 
+@torch.jit.script
+def concat_script(unpaded_im_mask, y_0, y_1, x_0, x_1, im_h, im_w):
+    # pad y
+    zeros_y0 = torch.zeros(y_0, unpaded_im_mask.shape[1])
+    zeros_y1 = torch.zeros(im_h - y_1, unpaded_im_mask.shape[1])
+    concat_0 = torch.cat((zeros_y0,
+                          unpaded_im_mask,
+                          zeros_y1), 0)
+
+    # pad x
+    zeros_x0 = torch.zeros(concat_0.shape[0], x_0)
+    zeros_x1 = torch.zeros(concat_0.shape[0], im_w - x_1)
+    im_mask = torch.cat((zeros_x0.to(dtype=torch.float32),
+                         concat_0.to(dtype=torch.float32),
+                         zeros_x1.to(dtype=torch.float32)), 1)
+
+    #print("sizes--- : ", im_mask.size())
+    # remove following line
+    im_mask = torch.nn.functional.interpolate(im_mask.unsqueeze(0).unsqueeze(0),
+                                     size=(1280, 800),
+                                     mode='nearest').squeeze()
+    return im_mask
+
+def _onnx_paste_mask_in_image_trace(mask, box, im_h, im_w):
+    TO_REMOVE = 1
+
+    # remove tensor()
+    w = (box[2] - box[0] + torch.tensor([TO_REMOVE], dtype=torch.int32)).to(dtype=torch.int32)
+    h = (box[3] - box[1] + torch.tensor([TO_REMOVE], dtype=torch.int32)).to(dtype=torch.int32)
+    w = torch.max(torch.cat((w, torch.tensor([1], dtype=torch.int32)), 0))
+    h = torch.max(torch.cat((h, torch.tensor([1], dtype=torch.int32)), 0))
+
+    # Set shape to [batchxCxHxW]
+    mask = mask.expand((1, 1, mask.shape[0], mask.shape[1]))
+
+    # Resize mask
+    #mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='nearest')#, align_corners=False)
+    mask = torch.nn.functional.interpolate(mask, size=(int(h), int(w)), mode='nearest')#, align_corners=False)
+    mask = mask[0][0]
+
+    #import pdb
+    #pdb.set_trace()
+    x_0 = torch.max(torch.cat((box[0].unsqueeze(0).to(dtype=torch.float32),
+                               torch.tensor([0], dtype=torch.float32)),
+                               0)).to(torch.int64)
+    x_1 = torch.min(torch.cat((box[2].unsqueeze(0).to(dtype=torch.float32) + torch.tensor([1], dtype=torch.float32),
+                               im_w.unsqueeze(0).to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+    y_0 = torch.max(torch.cat((box[1].unsqueeze(0).to(dtype=torch.float32),
+                               torch.tensor([0], dtype=torch.float32)),
+                               0)).to(torch.int64)
+    y_1 = torch.min(torch.cat((box[3].unsqueeze(0).to(dtype=torch.float32) + torch.tensor([1], dtype=torch.float32),
+                               im_h.unsqueeze(0).to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+
+    unpaded_im_mask = mask[(y_0 - box[1].to(torch.int64)):
+                           (y_1 - box[1].to(torch.int64)),
+                           (x_0 - box[0].to(torch.int64)):
+                           (x_1 - box[0].to(torch.int64))]
+
+    '''
+    # pad y
+    zeros_y0 = torch.zeros(y_0, unpaded_im_mask.shape[1])
+    zeros_y1 = torch.zeros(im_h - y_1, unpaded_im_mask.shape[1])
+    concat_0 = torch.cat((zeros_y0,
+                          unpaded_im_mask,
+                          zeros_y1), 0)
+
+    # pad x
+    zeros_x0 = torch.zeros(concat_0.shape[0], x_0)
+    zeros_x1 = torch.zeros(concat_0.shape[0], im_w - x_1)
+    im_mask = torch.cat((zeros_x0.to(dtype=torch.float32),
+                         concat_0.to(dtype=torch.float32),
+                         zeros_x1.to(dtype=torch.float32)), 1)
+
+    #print("sizes--- : ", im_mask.size())
+    # remove following line
+    im_mask = torch.nn.functional.interpolate(im_mask.unsqueeze(0).unsqueeze(0),
+                                     size=(1280, 800),
+                                     mode='nearest').squeeze()
+    '''
+
+    im_mask = concat_script(unpaded_im_mask,
+                            y_0, y_1,
+                            x_0, x_1,
+                            im_h, im_w)
+
+    print("sizes--- : ", im_mask.size())
+    return im_mask
+
+#@torch.jit.script
+def _onnx_paste_mask_in_image(mask, box, im_h, im_w):
+    #TO_REMOVE = 1
+    unsq_one = torch.ones(1) #.unsqueeze(0)
+    unsq_zero = torch.zeros(1) #.unsqueeze(0)
+
+    # remove tensor()
+    w = (box[2] - box[0] + unsq_one.to(dtype=torch.int32)).to(dtype=torch.int32)
+    h = (box[3] - box[1] + unsq_one.to(dtype=torch.int32)).to(dtype=torch.int32)
+    w = torch.max(torch.cat((w, unsq_one.to(dtype=torch.int32)), 0))
+    h = torch.max(torch.cat((h, unsq_one.to(dtype=torch.int32)), 0))
+
+    # Set shape to [batchxCxHxW]
+    mask = mask.expand((1, 1, mask.shape[0], mask.shape[1]))
+
+    # Resize mask
+    #mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='bilinear')#, align_corners=False)
+    mask = torch.nn.functional.interpolate(mask, size=(int(h), int(w)), mode='nearest')
+    mask = mask[0][0]
+    
+    #import pdb
+    #pdb.set_trace()
+    x_0 = torch.max(torch.cat((box[0].unsqueeze(0).to(dtype=torch.float32),
+                               unsq_zero.to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+    x_1 = torch.min(torch.cat((box[2].unsqueeze(0).to(dtype=torch.float32) + unsq_one.to(dtype=torch.float32),
+                               im_w.unsqueeze(0).to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+    y_0 = torch.max(torch.cat((box[1].unsqueeze(0).to(dtype=torch.float32),
+                               unsq_zero.to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+    y_1 = torch.min(torch.cat((box[3].unsqueeze(0).to(dtype=torch.float32) + unsq_one.to(dtype=torch.float32),
+                               im_h.unsqueeze(0).to(dtype=torch.float32)),
+                               0)).to(torch.int64)
+
+    unpaded_im_mask = mask[(y_0 - box[1].to(torch.int64)):
+                           (y_1 - box[1].to(torch.int64)),
+                           (x_0 - box[0].to(torch.int64)):
+                           (x_1 - box[0].to(torch.int64))]
+
+    # pad y
+    zeros_y0 = torch.zeros(y_0, unpaded_im_mask.shape[1],
+                           dtype=mask.dtype, device=mask.device,
+                           layout=torch.strided
+                           )
+    zeros_y1 = torch.zeros(im_h - y_1, unpaded_im_mask.shape[1],
+                           dtype=mask.dtype, device=mask.device,
+                           layout=torch.strided
+                           )
+    concat_0 = torch.cat((zeros_y0, unpaded_im_mask, zeros_y1), 0)
+
+    # pad x
+    zeros_x0 = torch.zeros(concat_0.shape[0], x_0,
+                           dtype=mask.dtype, device=mask.device,
+                           layout=torch.strided
+                           )
+    zeros_x1 = torch.zeros(concat_0.shape[0], im_w - x_1,
+                           dtype=mask.dtype, device=mask.device,
+                           layout=torch.strided
+                           )
+    im_mask = torch.cat((zeros_x0.to(dtype=torch.float32),
+                         concat_0.to(dtype=torch.float32),
+                         zeros_x1.to(dtype=torch.float32)), 1)
+
+    # remove following line
+    #im_mask = torch.nn.functional.interpolate(im_mask.unsqueeze(0).unsqueeze(0),
+    #                                  size=(1280, 800),
+    #                                  mode='nearest').squeeze()
+
+    print("sizes--- : ", im_mask.size())
+    return im_mask
+
+__onnx_test = torch.jit.trace(_onnx_paste_mask_in_image_trace,
+                              (torch.rand(30, 30),
+                               torch.rand(4),
+                               torch.tensor(1280),
+                               torch.tensor(800)))
 
 def paste_mask_in_image(mask, box, im_h, im_w):
+    # add comment
+    if True: # torch._C._get_tracing_state():
+        return _onnx_paste_mask_in_image(mask, box, im_h, im_w)
+
     TO_REMOVE = 1
     w = int(box[2] - box[0] + TO_REMOVE)
     h = int(box[3] - box[1] + TO_REMOVE)
@@ -288,7 +482,7 @@ def paste_mask_in_image(mask, box, im_h, im_w):
     mask = mask.expand((1, 1, -1, -1))
 
     # Resize mask
-    mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='bilinear', align_corners=False)
+    mask = misc_nn_ops.interpolate(mask, size=(h, w), mode='nearest')#, align_corners=False)
     mask = mask[0][0]
 
     im_mask = torch.zeros((im_h, im_w), dtype=mask.dtype, device=mask.device)
@@ -298,24 +492,65 @@ def paste_mask_in_image(mask, box, im_h, im_w):
     y_1 = min(box[3] + 1, im_h)
 
     im_mask[y_0:y_1, x_0:x_1] = mask[
-        (y_0 - box[1]):(y_1 - box[1]), (x_0 - box[0]):(x_1 - box[0])
+        (y_0 - box[1]):(y_1 - box[1]),
+        (x_0 - box[0]):(x_1 - box[0])
     ]
     return im_mask
 
+@torch.jit.script
+def paste_mask_in_image_s(masks, boxes, img_shape, res2):
+    im_h = img_shape[0]
+    im_w = img_shape[1]
+    for i in range(masks.size(0)):
+        m = masks[i]
+        b = boxes[i]
+
+        #print(m[0].size(),  b.size())
+        #mask_res =  _onnx_paste_mask_in_image2(m[0], b, im_h, im_w)
+        #print("sizes : ", m[0].size(), b.size(), im_w.size(), im_h.size())
+
+        #print("trace with : ", m[0].size(), b.size(), im_h, im_w)
+        mask_res = __onnx_test(m[0], b, im_h, im_w)
+        #mask_res = _onnx_paste_mask_in_image(m[0], b, im_h, im_w)
+        #print("sizes0 : ", mask_res.size(), res2.size())
+        mask_res = mask_res.unsqueeze(0)
+        #print("sizes : ", mask_res.size(), res2.size())
+        #import pdb
+        #pdb.set_trace()
+        res2 = torch.cat((res2.to(dtype=torch.float32),
+                          mask_res.to(dtype=torch.float32)))
+        #res2 = mask_res
+    return res2
 
 def paste_masks_in_image(masks, boxes, img_shape, padding=1):
     masks, scale = expand_masks(masks, padding=padding)
-    boxes = expand_boxes(boxes, scale).to(dtype=torch.int64).tolist()
+    boxes = expand_boxes(boxes, scale).to(dtype=torch.int64) #.tolist()
     # im_h, im_w = img_shape.tolist()
+    #print("\n\n-----------------------len boxes",len(boxes))
+    #print(boxes.size(), boxes[0].size(), boxes[:,0].size())
     im_h, im_w = img_shape
-    res = [
-        paste_mask_in_image(m[0], b, im_h, im_w)
-        for m, b in zip(masks, boxes)
-    ]
-    if len(res) > 0:
-        res = torch.stack(res, dim=0)[:, None]
-    else:
-        res = masks.new_empty((0, 1, im_h, im_w))
+
+    res2 = torch.zeros(0, im_h, im_w, dtype=torch.float32)
+
+    f = open("traced_graph.txt","w+")
+    f.write(str(__onnx_test.graph))
+    f.close() 
+
+    res = paste_mask_in_image_s(masks,
+                                boxes,
+                                torch.tensor(img_shape),
+                                res2)
+
+    #res = res[:, None]v
+    #res = [
+    #    paste_mask_in_image(m[0], b, im_h, im_w)
+    #    for m, b in zip(masks, boxes)
+    #]
+    #if len(res) > 0:
+        #print([x.size() for x in res])
+    #    res = torch.stack(res, dim=0)[:, None]
+    #else:
+    #    res = masks.new_empty((0, 1, im_h, im_w))
     return res
 
 
@@ -444,7 +679,10 @@ class RoIHeads(torch.nn.Module):
 
     def select_training_samples(self, proposals, targets):
         self.check_targets(targets)
-        gt_boxes = [t["boxes"] for t in targets]
+        #gt_boxes = [t["boxes"] for t in targets]
+        dtype = proposals[0].dtype
+        gt_boxes = [t["boxes"].to(dtype) for t in targets]
+
         gt_labels = [t["labels"] for t in targets]
 
         # append ground-truth bboxes to propos
@@ -476,8 +714,13 @@ class RoIHeads(torch.nn.Module):
         pred_scores = F.softmax(class_logits, -1)
 
         # split boxes and scores per image
-        pred_boxes = pred_boxes.split(boxes_per_image, 0)
-        pred_scores = pred_scores.split(boxes_per_image, 0)
+        if torch._C._get_tracing_state():
+            ## add if tracing + check nb batch
+            pred_boxes = (pred_boxes,) 
+            pred_scores = (pred_scores,)
+        else:
+            pred_boxes = pred_boxes.split(boxes_per_image, 0)
+            pred_scores = pred_scores.split(boxes_per_image, 0)
 
         all_boxes = []
         all_scores = []
@@ -496,22 +739,39 @@ class RoIHeads(torch.nn.Module):
 
             # batch everything, by making every class prediction be a separate instance
             boxes = boxes.reshape(-1, 4)
-            scores = scores.flatten()
-            labels = labels.flatten()
-
+            scores = scores.reshape(-1)
+            labels = labels.reshape(-1)
             # remove low scoring boxes
-            inds = torch.nonzero(scores > self.score_thresh).squeeze(1)
+            inds = torch.nonzero(torch.gt(scores, self.score_thresh)).squeeze(1)
             boxes, scores, labels = boxes[inds], scores[inds], labels[inds]
 
             # remove empty boxes
             keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
             boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
 
+            #return boxes,boxes,boxes
             # non-maximum suppression, independently done per class
             keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
             # keep only topk scoring predictions
+
+            #print((keep))
+
+            '''if not torch._C._get_tracing_state():
+                keep = torch.tensor([128  ,29 , 28 ,
+                30 , 73,  59,  34, 257, 151, 245 , 55 ,
+                49 ,  4, 236,  12, 209,  40, 112,
+                285, 204, 248, 398, 291, 205, 277, 422, 113,
+                305,  98, 159, 351, 187, 450, 191,  64, 390,
+                388, 357, 185, 429, 163,  61, 391, 409, 141,
+                111, 404, 130, 256, 312, 114, 439, 194, 268,
+                444 ,206, 465,  99, 143, 392, 414, 282, 223,
+                424, 374, 358, 253, 438, 301, 225,  69, 330,
+                33, 423, 381, 344, 119, 148, 375, 321, 478])'''
+
+            #return keep,keep,keep
             keep = keep[:self.detections_per_img]
             boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+            #return boxes,boxes,boxes
 
             all_boxes.append(boxes)
             all_scores.append(scores)
@@ -519,7 +779,7 @@ class RoIHeads(torch.nn.Module):
 
         return all_boxes, all_scores, all_labels
 
-    def forward(self, features, proposals, image_shapes, targets=None):
+    def forward(self, features, proposals, image_shapes=None, targets=None):
         """
         Arguments:
             features (List[Tensor])
@@ -527,6 +787,23 @@ class RoIHeads(torch.nn.Module):
             image_shapes (List[Tuple[H, W]])
             targets (List[Dict])
         """
+        '''if image_shapes == None:
+            image_shapes = [torch.Size([1280, 800])]
+        from collections import OrderedDict
+        
+        if isinstance(features_l, list):
+            features = OrderedDict()
+            for i in range(len(features_l)):
+                if i == 4:
+                    #print(i)
+                    #print(features_l[i])
+                    features['pool'] = features_l[i]
+                #print(i, features_l[i].size())
+                features[i] = features_l[i] 
+        else:
+            features = features_l'''
+
+
         if targets is not None:
             for t in targets:
                 assert t["boxes"].dtype.is_floating_point, 'target boxes must of float type'
@@ -536,9 +813,14 @@ class RoIHeads(torch.nn.Module):
 
         if self.training:
             proposals, matched_idxs, labels, regression_targets = self.select_training_samples(proposals, targets)
+        #print("image_shapes   : ", image_shapes)
+
 
         box_features = self.box_roi_pool(features, proposals, image_shapes)
+        
+        
         box_features = self.box_head(box_features)
+
         class_logits, box_regression = self.box_predictor(box_features)
 
         result, losses = [], {}
@@ -574,6 +856,7 @@ class RoIHeads(torch.nn.Module):
             mask_features = self.mask_head(mask_features)
             mask_logits = self.mask_predictor(mask_features)
 
+            #res_mak = []
             loss_mask = {}
             if self.training:
                 gt_masks = [t["masks"] for t in targets]
@@ -585,10 +868,27 @@ class RoIHeads(torch.nn.Module):
             else:
                 labels = [r["labels"] for r in result]
                 masks_probs = maskrcnn_inference(mask_logits, labels)
+                #return masks_probs, []
+                #print("------------------->",len(masks_probs), len(result), masks_probs[0].size())
+                #result[0]["masks"] = masks_probs[0]
                 for mask_prob, r in zip(masks_probs, result):
                     r["masks"] = mask_prob
-
+                    #res_mak.append(mask_prob)
+                    #res_mak.append(r['boxes'])
+                    #res_mak.append(r['labels'])
+                    #res_mak.append(r['scores'])
+                    #res_mak.append(mask_prob)
+                #    print(r['boxes'].size(), mask_prob.size())
+                #    res_mak.append(
+                #    dict(
+                #        boxes=r['boxes'],
+                #        labels=r['labels'],
+                #        scores=r['scores'],
+                #        masks=mask_prob
+                #    ))
+                #return res_mak, []
             losses.update(loss_mask)
+
 
         if self.has_keypoint:
             keypoint_proposals = [p["boxes"] for p in result]
@@ -621,4 +921,6 @@ class RoIHeads(torch.nn.Module):
 
             losses.update(loss_keypoint)
 
+        print("\n\n\nEND OF ROI HEADS\n\n\n")
+        #return [], []
         return result, losses
