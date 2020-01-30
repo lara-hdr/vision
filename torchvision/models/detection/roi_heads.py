@@ -754,6 +754,7 @@ class RoIHeads(torch.nn.Module):
             matched_idxs = None
 
         box_features = self.box_roi_pool(features, proposals, image_shapes)
+        return box_features, {}
         box_features = self.box_head(box_features)
         class_logits, box_regression = self.box_predictor(box_features)
 

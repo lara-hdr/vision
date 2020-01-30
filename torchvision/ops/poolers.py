@@ -203,7 +203,7 @@ class MultiScaleRoIAlign(nn.Module):
 
         levels = mapper(boxes)
 
-        num_rois = len(rois)
+        num_rois = rois.size(0) #len(rois)
         num_channels = x_filtered[0].shape[1]
 
         dtype, device = x_filtered[0].dtype, x_filtered[0].device
@@ -224,11 +224,13 @@ class MultiScaleRoIAlign(nn.Module):
                 spatial_scale=scale, sampling_ratio=self.sampling_ratio)
 
             if torchvision._is_tracing():
-                tracing_results.append(result_idx_in_level.to(dtype))
-            else:
+                #tracing_results.append(result_idx_in_level.to(dtype))
                 result[idx_in_level] = result_idx_in_level
+            else:
+                #tracing_results.append(result_idx_in_level.to(dtype))
+                result[idx_in_level] = result_idx_in_level
+            return result, rois #, result_idx_in_level, idx_in_level  # ==> result different when adding/removing rois from the output
 
-        if torchvision._is_tracing():
-            result = _onnx_merge_levels(levels, tracing_results)
-
-        return result
+        #if torchvision._is_tracing():
+        #    result = _onnx_merge_levels(levels, tracing_results)
+        return result #, idx_in_level, result_idx_in_level, rois
